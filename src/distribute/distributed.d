@@ -7,13 +7,10 @@ module distribute.distributed;
 
 import std.traits;
 import std.string;
+import distribute.distributed_base;
+import distribute.utils.reflection;
 
 private:
-
-/**
- * Determines whether symbol is accessible outside of the distribute package.
- */
-enum bool _IsAccessible(alias symbol) = __traits(getProtection, symbol) == "public" || __traits(getProtection, symbol) == "export";
 
 /**
  * Returns a tuple of symbol's User-Defined Attributes (UDAs) as a string prefixed with an @.
@@ -199,6 +196,20 @@ if(isFunction!symbol || isDelegate!symbol)
 }
 
 /**
+ * Returns a function declaration and definition for some function symbol.
+ * Intended to be called at compile time.
+ *
+ * Params:
+ * 	name = The name of the function represented by symbol.
+ *
+ * Returns: A string representing a function declaration and definition.
+ */
+static string _mimicFunction(alias symbol)(immutable string name) pure @safe
+{
+	return _mimicFuncDecl!symbol(name) ~ " " ~ _mimicFuncDef!symbol(name);
+}
+
+/**
  * Returns a field declaration for some field symbol.
  * External linkages are omitted, as are any parameterizations for the package access modifier.
  * Intended to be called at compile time.
@@ -227,7 +238,21 @@ if(!isFunction!symbol && !isDelegate!symbol)
 	//Add the new Distributed type, move the original type qualifiers out, and name of the new field.
 	field ~= CopyTypeQualifiers!(typeof(symbol), Distributed!(Unqual!(typeof(symbol)))).stringof ~ " " ~ name;
 	
-	return field;
+	return field ~ ";";
+}
+
+/**
+ * Returns a type alias for some type name belonging to type T.
+ * Intended to be called at compile time.
+ *
+ * Params:
+ * 	name = The name of some type which is a member of type T.
+ *
+ * Returns: A string representing a type alias.
+ */
+static string _mimicType(alias symbol)(immutable string name) pure @safe
+{
+	return "alias " ~ name ~ " = T." ~ name ~ ";";
 }
 
 
@@ -237,71 +262,10 @@ public:
  * Provides consensus logic for an instance of its template parameter.
  * Mimics the member functions and member variables of its template parameter.
  */
-class Distributed(T)
+class Distributed(T) : Distributed_Base!T
 {
-	static if(is(T == class) || is(T == struct) || is(T == union))
-	{
-		static foreach(immutable member; __traits(allMembers, T))
-		{
-			static if(member != "this")	//Ignore the context pointer (if it exists).
-			{
-				static if(member.length < 2 || !(member[0] == '_' && member[1] == '_'))	//Ignore double-underscore members, they're reserved.
-				{
-					static if(!__traits(isTemplate, __traits(getMember, T, member)))	//Ignore templates, they return no type (void).
-					{
-						static if(!__traits(hasMember, Distributed!T, member))
-						{
-							static if(isFunction!(__traits(getMember, T, member)) || isDelegate!(__traits(getMember, T, member)))
-							{
-								static foreach(immutable overload; __traits(getOverloads, T, member))
-								{
-									static if(_IsAccessible!overload)
-									{
-										mixin(_mimicFuncDecl!overload(member) ~ " " ~ _mimicFuncDef!overload(member));
-									}
-								}
-							}
-							else
-							{
-								static if(_IsAccessible!(__traits(getMember, T, member)))
-								{
-									static if(__traits(compiles, typeof(__traits(getMember, T, member))))
-									{
-										mixin(_mimicField!(__traits(getMember, T, member))(member) ~ ";");
-									}
-									else
-									{
-										mixin("alias " ~ member ~ " = T." ~ member ~ ";");
-									}
-								}
-							}
-						}
-						
-					}
-				}
-			}
-		}
-	}
+	mixin(forAllMembers!(T, _mimicFunction, _mimicField, _mimicType)());
 }
-
-class A
-{
-	class B
-	{
-		class C
-		{
-			bool a;
-			long b(inout int x) inout {return x;}
-		}
-		
-		int a;
-		float b(ref const long x) {return cast(float)x;}
-	}
-	
-	int a;
-	void b(int x = 1) {};
-}
-
 unittest
 {
 	class Example
@@ -371,13 +335,13 @@ unittest
 		{
 			static foreach(immutable idx; 0 .. " ~ a ~ ".length)
 			{
-				static if(__traits(compiles, typeof(" ~ a ~ "[idx])) && __traits(compiles, typeof(" ~ b ~ "[idx])))
-				{
-					valid &= " ~ a ~ "[idx] == " ~ b ~ "[idx];
-				}
-				else static if(!__traits(compiles, typeof(" ~ a ~ "[idx])) && !__traits(compiles, typeof(" ~ b ~ "[idx])))
+				static if(is(" ~ a ~ "[idx]) && is(" ~ b ~ "[idx]))
 				{
 					valid &= is(" ~ a ~ "[idx] == " ~ b ~ "[idx]);
+				}
+				else static if(!is(" ~ a ~ "[idx]) && !is(" ~ b ~ "[idx]))
+				{
+					valid &= " ~ a ~ "[idx] == " ~ b ~ "[idx];
 				}
 				else
 				{
@@ -445,7 +409,11 @@ unittest
 							static if(_IsAccessible!tSymbol)
 							{
 								alias dSymbol = __traits(getMember, Distributed!T, member);
-								static if(__traits(compiles, typeof(tSymbol)))
+								static if(is(tSymbol))
+								{
+									//How should we check aliased types?
+								}
+								else
 								{
 									assert(
 										__traits(getProtection, tSymbol) == __traits(getProtection, dSymbol),
@@ -467,10 +435,6 @@ unittest
 										is(Distributed!(Unqual!(typeof(tSymbol))) == Unqual!(typeof(dSymbol))),
 										"Field " ~ member ~ " had type " ~ (Distributed!(Unqual!(typeof(tSymbol)))).stringof ~ ", but now it has type " ~ (Unqual!(typeof(dSymbol))).stringof ~ "."
 									);
-								}
-								else
-								{
-									//How should we check aliased types?
 								}
 							}
 						}
