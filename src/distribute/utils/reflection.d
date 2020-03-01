@@ -7,13 +7,9 @@ module distribute.utils.reflection;
 
 import std.traits;
 import distribute.distributed_base;
+import distribute.utils.tmp;
 
 package(distribute):
-
-/**
- * Determines whether symbol is accessible outside of the distribute package.
- */
-enum bool _IsAccessible(alias symbol) = __traits(getProtection, symbol) == "public" || __traits(getProtection, symbol) == "export";
 
 /**
  * Function which returns an empty string.
@@ -57,7 +53,7 @@ if(__traits(isTemplate, forFunction) && __traits(isTemplate, forField) && __trai
 							{
 								static foreach(immutable overload; __traits(getOverloads, T, member))
 								{
-									static if(_IsAccessible!overload)
+									static if(IsAccessible!overload)
 									{
 										code ~= forFunction!overload(member);
 									}
@@ -65,7 +61,7 @@ if(__traits(isTemplate, forFunction) && __traits(isTemplate, forField) && __trai
 							}
 							else
 							{
-								static if(_IsAccessible!(__traits(getMember, T, member)))
+								static if(IsAccessible!(__traits(getMember, T, member)))
 								{
 									static if(is(__traits(getMember, T, member)))
 									{

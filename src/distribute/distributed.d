@@ -8,7 +8,7 @@ module distribute.distributed;
 import std.traits;
 import std.string;
 import distribute.distributed_base;
-import distribute.utils.reflection;
+import distribute.utils;
 
 private:
 
@@ -205,6 +205,7 @@ if(isFunction!symbol || isDelegate!symbol)
  * Returns: A string representing a function declaration and definition.
  */
 static string _mimicFunction(alias symbol)(immutable string name) pure @safe
+if(isFunction!symbol || isDelegate!symbol)
 {
 	return _mimicFuncDecl!symbol(name) ~ " " ~ _mimicFuncDef!symbol(name);
 }
@@ -220,7 +221,7 @@ static string _mimicFunction(alias symbol)(immutable string name) pure @safe
  * Returns: A string representing a field declaration.
  */
 static string _mimicField(alias symbol)(immutable string name) pure @safe
-if(!isFunction!symbol && !isDelegate!symbol)
+if(!isFunction!symbol && !isDelegate!symbol && !is(symbol))
 {
 	//Start with the field's access modifier.
 	string field = __traits(getProtection, symbol) ~ " ";
@@ -251,6 +252,7 @@ if(!isFunction!symbol && !isDelegate!symbol)
  * Returns: A string representing a type alias.
  */
 static string _mimicType(alias symbol)(immutable string name) pure @safe
+if(is(symbol))
 {
 	return "alias " ~ name ~ " = T." ~ name ~ ";";
 }
@@ -373,7 +375,7 @@ unittest
 						{
 							static foreach(immutable tOverload; __traits(getOverloads, T, member))
 							{
-								static if(_IsAccessible!tOverload)
+								static if(IsAccessible!tOverload)
 								{
 									assert(
 										function bool()
@@ -406,7 +408,7 @@ unittest
 						}
 						else
 						{
-							static if(_IsAccessible!tSymbol)
+							static if(IsAccessible!tSymbol)
 							{
 								alias dSymbol = __traits(getMember, Distributed!T, member);
 								static if(is(tSymbol))
