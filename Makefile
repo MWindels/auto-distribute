@@ -5,16 +5,22 @@ all:
 
 
 ### Build Commands ###
-.PHONY: $(FILE)-test
+.PHONY: test-id test-entry test-pool test-distributed
 
 utils.lib: $(wildcard $(INCLUDE)/distribute/utils/*.d)
-	dmd -lib -of=utils.lib -I=$(INCLUDE) $(wildcard $(INCLUDE)/distribute/utils/*.d)
+	dmd -w -lib -of=utils.lib -I=$(INCLUDE) $(wildcard $(INCLUDE)/distribute/utils/*.d)
 
-$(FILE).exe: utils.lib
-	dmd -I=$(INCLUDE) utils.lib $(INCLUDE)/distribute/$(FILE).d
+test-id: utils.lib
+	dmd -I=$(INCLUDE) utils.lib -w -main -unittest -run $(INCLUDE)/distribute/id.d
 
-$(FILE)-test: utils.lib
-	dmd -I=$(INCLUDE) utils.lib -unittest -run $(INCLUDE)/distribute/$(FILE).d
+test-entry: utils.lib
+	dmd -I=$(INCLUDE) utils.lib -w -main -unittest -run $(INCLUDE)/distribute/entry.d
+
+test-pool: utils.lib
+	dmd -I=$(INCLUDE) utils.lib -w -main -unittest -run $(INCLUDE)/distribute/pool.d
+
+test-distributed: utils.lib
+	dmd -I=$(INCLUDE) utils.lib -w -main -unittest -run $(INCLUDE)/distribute/distributed.d $(INCLUDE)/distribute/distributed_base.d
 
 
 ### Clean Commands ###

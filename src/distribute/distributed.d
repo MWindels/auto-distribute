@@ -448,8 +448,3 @@ unittest
 	
 	test!Example();
 }
-
-void main()
-{
-	
-}

@@ -5,175 +5,250 @@
  */
 module distribute.consensus;
 
-//import std.typecons : Rebindable;
+import std.socket;
+import std.typecons : Rebindable, Nullable;
+import std.concurrency;
+import std.random;
 //import distribute.entry;
-
-private:
-
-/**
- * Represents a proposal ID.
- */
-struct ID
-{
-	uint round;
-	uint node;
-	
-	/**
-	 * Initializes a new ID.
-	 *
-	 * Params:
-	 * 	r = The round of the new ID.
-	 * 	n = The node of the new ID.
-	 */
-	this(uint r, uint n)
-	{
-		round = r;
-		node = n;
-	}
-	
-	/**
-	 * Compares two ID objects.
-	 *
-	 * Params:
-	 * 	other = The other ID being compared.
-	 *
-	 * Returns: Negative if this is lower than other, zero if they're identical, positive if this is higher than other.
-	 */
-	int opCmp(ID other) const
-	{
-		if(round < other.round)
-		{
-			return -1;
-		}
-		else if(round > other.round)
-		{
-			return 1;
-		}
-		else
-		{
-			if(node < other.node)
-			{
-				return -1;
-			}
-			else if(node > other.node)
-			{
-				return 1;
-			}
-			else
-			{
-				return 0;
-			}
-		}
-	}
-	
-	/**
-	 * Performs a binary operation on an ID's round number and an unsigned integer.
-	 * Currently supports addition.
-	 *
-	 * Params:
-	 * 	rnd = The unsigned integer operand.
-	 *
-	 * Returns: An ID whose round number is round op rnd.
-	 */
-	ID opBinary(string op)(uint rnd) const
-	if(op == "+")
-	{
-		return ID(mixin("round " ~ op ~ " rnd"), node);
-	}
-	
-	/**
-	 * Performs a binary operation on an ID's round number and another ID's round number.
-	 * See unsigned integer overload for details.
-	 */
-	ID opBinary(string op)(ID other) const
-	{
-		return opBinary!op(other.round);
-	}
-	
-	/**
-	 * Performs an assignment operation on an ID's round number and an unsigned integer.
-	 * Currently supports addition assignment.
-	 *
-	 * Params:
-	 * 	rnd = The unsigned integer operand.
-	 */
-	void opOpAssign(string op)(uint rnd)
-	if(op == "+")
-	{
-		mixin("round " ~ op ~ "= rnd;");
-	}
-	
-	/**
-	 * Performs an assignment operation on an ID's round number and another ID's round number.
-	 * See unsigned integer overload for details.
-	 */
-	void opOpAssign(string op)(ID other)
-	{
-		opOpAssign!op(other.round);
-	}
-}
-unittest
-{
-	assert(ID(1, 1) < ID(2, 1));
-	assert(ID(1, 1) < ID(1, 2));
-	assert(ID(1, 1) <= ID(2, 1));
-	assert(ID(1, 1) <= ID(1, 2));
-	assert(ID(1, 1) <= ID(1, 1));
-	assert(ID(1, 1) == ID(1, 1));
-	assert(ID(1, 1) != ID(1, 2));
-	assert(ID(1, 1) != ID(2, 1));
-	assert(ID(1, 1) >= ID(1, 1));
-	assert(ID(1, 2) >= ID(1, 1));
-	assert(ID(2, 1) >= ID(1, 1));
-	assert(ID(1, 2) > ID(1, 1));
-	assert(ID(2, 1) > ID(1, 1));
-	
-	assert(ID(1, 1) + 1 == ID(2, 1));
-	assert(ID(2, 2) + 10 == ID(12, 2));
-	
-	assert(ID(1, 1) + ID(1, 1) == ID(2, 1));
-	assert(ID(2, 2) + ID(10, 1) == ID(12, 2));
-	
-	ID i = ID(1, 1);
-	assert(i == ID(1, 1));
-	i += 1;
-	assert(i == ID(2, 1));
-	i += 10;
-	assert(i == ID(12, 1));
-	
-	ID j = ID(1, 1);
-	assert(j == ID(1, 1));
-	j += ID(1, 2);
-	assert(j == ID(2, 1));
-	j += ID(10, 1);
-	assert(j == ID(12, 1));
-	
-	immutable ID k = ID(1, 1);
-	assert(k < ID(2, 1));
-	assert(k + 1 == ID(2, 1));
-	assert(k + ID(1, 1) == ID(2, 1));
-}
-
+import distribute.id;
 
 package:
 
 /**
  * Contains multi-paxos consensus state/logic.
  */
-/+class Consensus(T)
+class Consensus(T)
 {
-	/** 
+	private immutable Tid _manager;
+	
+	private immutable ushort _listenPort;
+	private immutable Tid _listener;
+	
+	private shared Object _closeLock;
+	private shared bool _closing = false;
+	
+	private shared Object _paxosLock;
+	private shared Nullable!Tid _follower;	//The thread responsable for interfacing with the leader node.
+	private shared ID _proposal;	//The highest proposal value seen so far.
+	
+	private enum _Operation : ubyte {_Prepare, _Accept, _Success, _Heartbeat}
+	
+	/**
+	 * Starts all of the necessary threads for a Consensus object.
 	 *
+	 * Params:
+	 * 	listenPort = The port by which vote requests arrive.
+	 * 	args = The arguments supplied to the data structure being distributed (if it's type is initialized with  a constructor, otherwise just an initial value).
 	 */
-	private class Qualified_Entry
+	this(Args...)(ushort listenPort, Args args)
 	{
-		Entry!T command;
+		_manager = spawn(&_manage, cast(shared)_initData(args));
+		
+		_listenPort = listenPort;
+		_listener = spawn(&_listen);
 	}
 	
-	private 
-}+/
-
-void main()
-{
+	/**
+	 * Stops all of the threads initiated by the constructor.
+	 */
+	~this()
+	{
+		synchronized(_closeLock)
+		{
+			_closing = true;
+		}
+		_nopCandidate();
+	}
 	
+	/**
+	 * Initializes a copy of the data structure being distributed.
+	 *
+	 * Params:
+	 * 	args = The arguments supplied to the data structure's constructor, or an initial value if the type isn't initialized with a constructor.
+	 *
+	 * Returns: A new object of type T constructed with (or equal to) args.
+	 */
+	private T _initData(Args...)(Args args) const
+	if(is(T == class) || is(T == struct) || is(T == union) || (Args.length == 1 && is(Args[0] == T)))
+	{
+		static if(is(T == class))
+		{
+			return new T(args);
+		}
+		else static if(is(T == struct) || is(T == union))
+		{
+			return T(args);
+		}
+		else
+		{
+			return args[0];
+		}
+	}
+	
+	/**
+	 * Controls access to the data structure being distributed and applies consensus logic.
+	 *
+	 * Params:
+	 * 	sharedData = The data structure being distributed.
+	 */
+	private void _manage(shared T sharedData)
+	{
+		T data = cast(T)sharedData;
+		
+		while(true)
+		{
+			synchronized(_closeLock)
+			{
+				if(_closing)
+				{
+					break;
+				}
+			}
+			
+			_Operation op;
+			bool recv = receiveTimeout(
+				dur!"ms"(150 + uniform!"[]"(0, 150)),
+				(_Operation o) {op = o;}
+			);
+			
+			if(recv)
+			{
+				switch(op)
+				{
+					case _Operation._Prepare:
+						//prepare
+						break;
+					case _Operation._Accept:
+						//accept
+						break;
+					case _Operation._Success:
+						//success
+						break;
+				}
+			}
+			else
+			{
+				//elect self as new leader.
+			}
+		}
+	}
+	
+	/**
+	 * Listens for leader candidates attempting to connect with this node.
+	 */
+	private void _listen()
+	{
+		TcpSocket listener = new TcpSocket(AddressFamily.INET);
+		listener.bind(new InternetAddress("localhost", _listenPort));
+		scope(exit) listener.close();
+		
+		while(true)
+		{
+			synchronized(_closeLock)
+			{
+				if(_closing)
+				{
+					break;
+				}
+			}
+			spawn(&_vote, cast(shared)listener.accept());
+		}
+	}
+	
+	/**
+	 * Spoofs a candidate connection.
+	 * Used to terminate _listener.
+	 */
+	private void _nopCandidate()
+	{
+		TcpSocket listener = new TcpSocket(AddressFamily.INET);
+		
+		try
+		{
+			listener.connect(new InternetAddress("localhost", _listenPort));
+		}
+		catch(SocketOSException)
+		{
+			return;
+		}
+		
+		scope(exit) listener.close();
+		listener.send(cast(ubyte[0])[]);	//This zero-length packet will automatically be rejected by _vote.
+	}
+	
+	/** 
+	 * Casts a vote for a candidate.
+	 * If the candidate's proposal number is higher than the local number, vote for them.
+	 * If the candidate's proposal number is equal to the local number, the connection was broken and is being re-established.
+	 *
+	 * Params:
+	 * 	sharedCandidate = A TcpSocket for communicating with the candidate.
+	 */
+	private void _vote(shared TcpSocket sharedCandidate)
+	{
+		TcpSocket candidate = cast(TcpSocket)sharedCandidate;	//Assumes that the owner thread will not use sharedCandidate.
+		scope(exit) candidate.close();
+		
+		ID candidateProposal;
+		ptrdiff_t recvSize = 0;
+		try
+		{
+			recvSize = candidate.receive((cast(ubyte*)&candidateProposal)[0 .. candidateProposal.sizeof]);
+		}
+		catch(SocketOSException)
+		{
+			return;
+		}
+		
+		if(recvSize == candidateProposal.sizeof)
+		{
+			ID tentativeProposal;
+			synchronized(_paxosLock)
+			{
+				tentativeProposal = _proposal;
+			}
+			
+			try
+			{
+				candidate.send((cast(ubyte*)&tentativeProposal)[0 .. tentativeProposal.sizeof]);	//Cast tentative vote.
+			}
+			catch(SocketOSException)
+			{
+				return;
+			}
+			
+			//If candidate's proposal is greater, then they're a new leader.
+			//If candidate's proposal is equal, then they're re-establishing a dropped connection.
+			if(tentativeProposal <= candidateProposal)
+			{
+				synchronized(_paxosLock)
+				{
+					if(_proposal == tentativeProposal)
+					{
+						/*if(!_follower.isNull)
+						{
+							send!ubyte(_follower.get(), 0);
+						}
+						
+						_follower = thisTid;*/
+						_proposal = candidateProposal;
+					}
+					else
+					{
+						return;
+					}
+				}
+				
+				_follow(candidate);
+			}
+		}
+	}
+	
+	/**
+	 *
+	 */
+	private void _follow(TcpSocket candidate)
+	{
+		//if recv'd a ubyte, nullify _follower
+	}
 }

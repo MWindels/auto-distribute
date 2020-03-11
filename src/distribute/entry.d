@@ -145,8 +145,3 @@ unittest
 	assert(!__traits(compiles, test!(Example, Example.e)));
 	test!(int, testSet!int)(8);
 }
-
-void main()
-{
-	
-}
