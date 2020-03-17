@@ -1,4 +1,5 @@
 /**
+ * Provides the definition of a proposal ID type.
  *
  * Author: Michael Windels.
  */

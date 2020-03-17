@@ -1,5 +1,5 @@
 /**
- * 
+ * Provides an implementation of multi-paxos used to distribute arbitrary types.
  *
  * Author: Michael Windels.
  */
@@ -107,7 +107,7 @@ class Consensus(T)
 			
 			_Operation op;
 			bool recv = receiveTimeout(
-				dur!"ms"(150 + uniform!"[]"(0, 150)),
+				dur!"msecs"(150 + uniform!"[]"(0, 150)),
 				(_Operation o) {op = o;}
 			);
 			
