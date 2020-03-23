@@ -13,6 +13,7 @@ import std.algorithm.iteration : map;
 import std.typecons : Tuple;
 import std.array : array;
 import core.thread : Thread;
+import distribute.utils.thread;
 
 private:
 
@@ -34,7 +35,7 @@ struct _StampedSocket
  *
  * Returns: The "array" array without the elements at the indices specified by "indices".
  */
-static T[] _removeIndices(T)(T[] array, uint[] indices)
+static T[] _removeIndices(T)(T[] array, const uint[] indices)
 {
 	for(int i = 0, j = 0; i < array.length - indices.length;)
 	{
@@ -54,51 +55,45 @@ static T[] _removeIndices(T)(T[] array, uint[] indices)
 	return array[0 .. ($ - indices.length)];
 }
 
-/**
- * Waits until it receives some Tid.
- *
- * Params:
- * 	tid = The Tid to wait for.
- */
-static void _waitForTid(const Tid tid)
-{
-	shared(Tid)[] tidResends = [];
-	shared(Variant)[] varResends = [];
-	
-	bool waiting = true;
-	while(waiting)
-	{
-		receive(
-			(Tid t)
-			{
-				if(t != tid)
-				{
-					tidResends ~= [cast(shared)t];
-				}
-				else
-				{
-					waiting = false;
-				}
-			},
-			(Variant v)
-			{
-				varResends ~= [cast(shared)v];
-			}
-		);
-	}
-	
-	foreach(t; tidResends)
-	{
-		spawn(() shared {send(ownerTid, cast(Tid)t);});
-	}
-	foreach(v; varResends)
-	{
-		spawn(() shared {send(ownerTid, cast(Variant)v);});
-	}
-}
-
 
 package:
+
+/**
+ * Sends an instance of some type to a socket.
+ * Intended for non-reference and non-pointer types (and types that do not contain references or pointers).
+ *
+ * Params:
+ * 	conn = The socket to send to.
+ * 	value = The value to send.
+ *
+ * Returns: True if value.sizeof bytes were sent, otherwise false.
+ *
+ * Throws: Anything thrown by Socket.send().
+ */
+static bool sendType(T)(Socket conn, in ref T value)
+{
+	return conn.send((cast(const void*)&value)[0 .. value.sizeof]) == value.sizeof;
+}
+
+/**
+ * Receives an instance of some type from a socket.
+ * Intended for non-reference and non-pointer types (and types that do not contain references or pointers).
+ *
+ * Params:
+ * 	conn = The socket to receive from.
+ * 	value = The value received (return parameter).
+ *
+ * Returns: True if value.sizeof bytes were received, otherwise false.
+ *
+ * Throws: Anything thrown by Socket.receive().
+ */
+static bool receiveType(T)(Socket conn, out T value)
+{
+	ubyte[value.sizeof] buffer;
+	bool success = conn.receive(buffer) == value.sizeof;
+	value = *(cast(T*)buffer);
+	return success;
+}
 
 /**
  * A pool of re-usable TCP sockets.
@@ -149,7 +144,7 @@ shared class ConnectionPool
 			}
 		}
 		
-		_waitForTid(_culler);
+		waitForTids(_culler);
 	}
 	
 	/**
@@ -161,10 +156,10 @@ shared class ConnectionPool
 	 */
 	private void _cull(uint interv, uint idleThresh)
 	{
+		scope(exit) send(ownerTid, thisTid);
+		
 		scope(exit)
 		{
-			scope(exit) send(ownerTid, thisTid);
-			
 			//Close all connections in the pool before leaving this function.
 			synchronized(_poolLock)
 			{
@@ -222,15 +217,17 @@ shared class ConnectionPool
 	
 	/**
 	 * Grabs a connection and passes it to a delegate so it can use that open connection.
-	 * The delegate must not close the connection.
+	 * The delegate must return a boolean denoting whether or not it successfully completed communication.
+	 * Furthermore, the delegate must not close the connection.
+	 * Can be called from multiple threads simultaneously.
 	 *
 	 * Params:
 	 * 	addr = The address to connect to.
 	 * 	dl = A delegate which operates on an open connection.
 	 *
-	 * Returns: True if the pool was open and dl was called, false if the pool was closed and dl was not called.
+	 * Returns: True if the pool was open and dl was called, false if the pool was closed and dl was not called (nothing about whether dl completed successfully).
 	 */
-	public bool perform(InternetAddress addr, void delegate(Socket) dl)
+	public bool perform(const InternetAddress addr, bool delegate(Socket) dl)
 	{
 		shared Socket conn;
 		bool newConn = true;
@@ -260,19 +257,33 @@ shared class ConnectionPool
 		if(newConn)
 		{
 			conn = cast(shared)(new Socket(AddressFamily.INET, SocketType.STREAM, ProtocolType.TCP));
-			(cast(Socket)conn).connect(addr);	//Might be best to just throw an exception for the user to deal with (they provided the address after all).
+			(cast(Socket)conn).connect(new InternetAddress(addr.addr, addr.port));	//Might be best to just throw an exception for the user to deal with (they provided the address after all).
 		}
 		
-		scope(exit)
+		scope(failure)
 		{
-			//spawn thread that sleeps for a few ms before returning the socket?
+			(cast(Socket)conn).close();
+			
+		}
+		
+		if(dl(cast(Socket)conn))
+		{
 			synchronized(_poolLock)
 			{
-				_pool[key] ~= [_StampedSocket(conn, MonoTime.currTime)];
+				if(_poolActive)
+				{
+					_pool[key] ~= [_StampedSocket(conn, MonoTime.currTime)];
+				}
+				else
+				{
+					(cast(Socket)conn).close();
+				}
 			}
 		}
-		
-		dl(cast(Socket)conn);
+		else
+		{
+			(cast(Socket)conn).close();
+		}
 		
 		return true;
 	}
@@ -287,7 +298,7 @@ unittest
 	
 	shared Object successesLock = new Object();
 	shared bool[num] successes;	//All elements default initialized to false.
-	auto process = (Socket conn)
+	bool delegate(Socket) process = (Socket conn)
 	{
 		Thread.sleep(dur!"msecs"(uniform!"[]"(0, 1000)));
 		
@@ -313,10 +324,14 @@ unittest
 		}
 		
 		send!ubyte(cast(Tid)mainThread, 0);
+		return true;	//Because of the asserts there's no reason to return false.
 	};
 	
-	shared TerminalPool term = new shared TerminalPool(32856, num, 50, 2, process);
-	scope(exit) term.close();
+	//These tests use a TerminalPool rather than an accept() socket because the ConnectionPool may create less than <num> sockets (and simply re-use them).
+	shared TerminalPool term1 = new shared TerminalPool(32856, num, 50, 2, process);
+	scope(exit) term1.close();
+	shared TerminalPool term2 = new shared TerminalPool(32858, num, 50, 2, process);
+	scope(exit) term2.close();
 	
 	//I figure idleThresh should be lower on the connection side so the terminal side is less likely to close the corresponding socket before the connection side has a chance to send anything.
 	shared ConnectionPool pool = new shared ConnectionPool(200, 1);
@@ -327,7 +342,7 @@ unittest
 		spawn(
 			(int idx) shared
 			{
-				auto sender = delegate void(Socket conn)
+				auto sender = delegate bool(Socket conn)
 				{
 					ubyte[size] sendBuffer;
 					for(int j = 0; j < size; ++j)
@@ -335,10 +350,19 @@ unittest
 						sendBuffer[j] = (idx + j) % size;
 					}
 					conn.send(sendBuffer);
+					return true;	//No real failure state, later asserts handle that.
 				};
 				
 				Thread.sleep(dur!"msecs"(uniform!"[]"(0, 1000)));
-				assert(pool.perform(new InternetAddress("localhost", 32856), sender), "ConnectionPool failed to perform().");
+				if(idx % 2 == 0)
+				{
+					assert(pool.perform(new InternetAddress("localhost", 32856), sender), "ConnectionPool failed to perform().");
+				}
+				else
+				{
+					assert(pool.perform(new InternetAddress("localhost", 32858), sender), "ConnectionPool failed to perform().");
+				}
+				
 			},
 			i
 		);
@@ -364,7 +388,8 @@ shared class TerminalPool
 	/**
 	 * Creates a new TerminalPool.
 	 * Note that interv should generally be fairly short so recently-used connections can be freed up regularly.
-	 * Also note that process must not close the Socket passed to it.
+	 * Also note that process must return a boolean denoting whether or not it successfully completed communication.
+	 * Furthermore, process must not close the Socket passed to it.
 	 *
 	 * Params:
 	 * 	port = The port on which to listen for connections.
@@ -373,7 +398,7 @@ shared class TerminalPool
 	 * 	idleThresh = The lower bound on the length of time (in seconds) which a connection can spend idle (unused) before it is closed.
 	 * 	process = The delegate which handles data received from an open connection (must be thread-safe).
 	 */
-	this(ushort port, uint conns, uint interv, uint idleThresh, shared void delegate(Socket) process)
+	this(ushort port, uint conns, uint interv, uint idleThresh, shared bool delegate(Socket) process)
 	{
 		_closeLock = new Object();
 		_listener = cast(immutable)spawn(&_listen, port, conns, interv, idleThresh, process);
@@ -398,7 +423,7 @@ shared class TerminalPool
 			}
 		}
 		
-		_waitForTid(_listener);
+		waitForTids(_listener);
 	}
 	
 	/**
@@ -411,9 +436,11 @@ shared class TerminalPool
 	 * 	idleThresh = The lower bound on the length of time (in seconds) which a connection can spend idle (unused) before it is closed.
 	 * 	process = The delegate which handles data received from an open connection (must be thread-safe).
 	 */
-	private void _listen(ushort port, uint conns, uint interv, uint idleThresh, shared void delegate(Socket) process) shared
+	private void _listen(ushort port, uint conns, uint interv, uint idleThresh, shared bool delegate(Socket) process) shared
 	{
-		//Build an connection-accepting socket.
+		scope(exit) send(ownerTid, thisTid);
+		
+		//Build a connection-accepting socket.
 		Socket listener = new Socket(AddressFamily.INET, SocketType.STREAM, ProtocolType.TCP);
 		listener.bind(new InternetAddress("localhost", port));
 		listener.listen(conns);
@@ -438,7 +465,7 @@ shared class TerminalPool
 		
 		//Wrap the process delegate with some house-keeping code.
 		void delegate(shared Socket) shared wrappedProcess = (shared Socket conn) shared
-		{	
+		{
 			scope(exit)
 			{
 				bool teardown = false;
@@ -459,19 +486,19 @@ shared class TerminalPool
 				}
 			}
 			
-			try
+			scope(failure)
 			{
-				scope(success)
-				{
-					synchronized(recentLock)
-					{
-						recent ~= [conn];
-					}
-				}
-				
-				process(cast(Socket)conn);
+				(cast(Socket)conn).close();
 			}
-			catch(SocketOSException)
+			
+			if(process(cast(Socket)conn))
+			{
+				synchronized(recentLock)
+				{
+					recent ~= [conn];
+				}
+			}
+			else
 			{
 				(cast(Socket)conn).close();
 			}
@@ -480,8 +507,6 @@ shared class TerminalPool
 		//On exit, close all open connections.
 		scope(exit)
 		{
-			scope(exit) send(ownerTid, thisTid);
-			
 			bool stillBusy = false;
 			synchronized(busyLock)
 			{
@@ -621,7 +646,7 @@ unittest
 	
 	shared Object recvLock = new Object();
 	shared ubyte[size][] recvBuffers = [];
-	shared (void delegate(Socket)) recv =
+	shared (bool delegate(Socket)) recv =
 	(Socket conn)
 	{
 		shared ubyte[size] interimBuffer;
@@ -634,6 +659,7 @@ unittest
 		}
 		
 		send!ubyte(cast(Tid)mainThread, 0);
+		return true;	//Implies no invalid state.
 	};
 	
 	shared TerminalPool term = new shared TerminalPool(32856, 10, 100, 3, recv);

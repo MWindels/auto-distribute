@@ -12,5 +12,5 @@ package:
  */
 class Distributed_Base(T)
 {
-	
+	//get and set functions
 }
