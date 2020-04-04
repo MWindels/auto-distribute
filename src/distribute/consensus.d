@@ -20,18 +20,56 @@ import distribute.entry;
 private:
 
 /**
- * Set a socket's send and receive timeouts to some random value in the range [150, 300] ms.
+ * Generates a random timeout in the range [low, low + var] ms.
+ *
+ * Params:
+ * 	low = The lower bound of the timeout.
+ * 	var = When added to low, this represents the upper bound of the timeout.
+ *
+ * Returns: A random timeout in the range [low, low + var] ms.
+ */
+static Duration _randomTimeout(uint low, uint var)
+{
+	return dur!"msecs"(low + uniform!"[]"(0, var));
+}
+
+/**
+ * Set a socket's send and receive timeouts to some specified value.
  *
  * Params:
  * 	conn = The socket whose timeouts are being set.
+ * 	timeout = The duration of the timeout.
  *
  * Throws: SocketException on failure.
  */
-static void _setRandomTimeout(Socket conn)
+static void _setTimeout(Socket conn, Duration timeout)
 {
-	Duration timeout = dur!"msecs"(150 + uniform!"[]"(0, 150));
 	conn.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, timeout);
 	conn.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, timeout);
+}
+
+/**
+ * Waits on a condition variable for some time.
+ * Assumes that cvar's lock is held.
+ * Handles spurious wakeups.
+ *
+ * Params:
+ * 	cvar = The condition variable to wait on.
+ * 	timeout = The duration of time to wait for.
+ *
+ * Returns: True if the cvar was notified before the timeout, otherwise false.
+ */
+static bool _wait(ref shared Condition cvar, Duration timeout)
+{
+	bool notified = false;
+	MonoTime start = MonoTime.currTime, now = start;
+	while(!notified && now - start < timeout)
+	{
+		notified = (cast(Condition)cvar).wait(timeout - (now - start));	//Yields the lock held by cvar.
+		now = MonoTime.currTime;
+	}
+	
+	return notified;
 }
 
 
@@ -63,7 +101,12 @@ shared class Consensus(T)
 	private shared Mutex _paxosLock;
 	private shared Condition _heartbeat;
 	private shared ID _term;
+	private shared bool _leading = false;	//Necessary as there are times when _term.node == _self but the node is not leading.
 	private shared _QualifiedEntry[] _log;
+	
+	//Request state.
+	private shared Object _requestsLock;
+	private shared uint _requests = 0;
 	
 	//Teardown data.
 	private shared Object _closeLock;
@@ -77,9 +120,9 @@ shared class Consensus(T)
 		//proposal number
 		//is-used flag
 		//is-chosen flag
-		Entry!T payload;
+		immutable Entry!T payload;
 		
-		this(Entry!T pl)
+		this(immutable Entry!T pl)
 		{
 			//lock = new Object();
 			payload = pl;
@@ -107,6 +150,8 @@ shared class Consensus(T)
 		_paxosLock = cast(shared)(new Mutex());
 		_heartbeat = cast(shared)(new Condition(cast(Mutex)_paxosLock));
 		_term = _proposal(0);
+		
+		_requestsLock = new Object();
 		
 		_closeLock = new Object();
 		
@@ -218,20 +263,11 @@ shared class Consensus(T)
 				}
 			}
 			
-			Duration timeout = dur!"msecs"(150 + uniform!"[]"(0, 150));
 			synchronized(_paxosLock)
 			{
 				//Wait for a heartbeat.
-				bool heartbeat = false;
-				MonoTime start = MonoTime.currTime, now = start;
-				while(!heartbeat && now - start < timeout)
-				{
-					heartbeat = (cast(Condition)_heartbeat).wait(timeout - (now - start));	//Note: This yields _paxosLock.
-					now = MonoTime.currTime;
-				}
-				
-				//Try to become leader if no heartbeat arrived.
-				if(!heartbeat)
+				//If none arrive, try to become leader.
+				if(!_wait(_heartbeat, _randomTimeout(150, 150)))
 				{
 					//Set up for a new election.
 					_term = _proposal(_term.round + 1);
@@ -250,10 +286,11 @@ shared class Consensus(T)
 										Tuple!(bool, ID) ballot = Tuple!(bool, ID)(false, ID(0, 0));
 										scope(exit) send(ownerTid, ballot);
 										
-										_sender.perform(_config[idx],
+										ballot[0] = _sender.perform(_config[idx],
 											delegate bool(Socket conn)
 											{
-												_setRandomTimeout(conn);
+												_setTimeout(conn, _randomTimeout(150, 150));
+												
 												_RPC identifier = _RPC.Vote;
 												if(sendType(conn, identifier))
 												{
@@ -262,13 +299,13 @@ shared class Consensus(T)
 														ID voterTerm;
 														if(receiveType(conn, voterTerm))
 														{
-															ballot[0] = true;
 															ballot[1] = voterTerm;
 															writeln("(", _self, ") Recv'd ballot (", voterTerm.round, ", ", voterTerm.node, ") in (", candidateTerm.round, ", ", candidateTerm.node, ")");
 															return true;
 														}
 													}
 												}
+												
 												return false;
 											}
 										);
@@ -326,12 +363,16 @@ shared class Consensus(T)
 	
 	/**
 	 * Controls what the node does while leading.
+	 * Assumes that _paxosLock is held.
 	 *
 	 * Params:
 	 * 	term = The ID identifying the term in which this node is leading.
 	 */
-	private void _lead(ID term)	//Should this just assume that _paxosLock is held?
+	private void _lead(ID term)
 	{
+		_leading = true;
+		scope(exit) _leading = false;
+		
 		while(true)
 		{
 			synchronized(_closeLock)
@@ -342,13 +383,24 @@ shared class Consensus(T)
 				}
 			}
 			
+			//If leadership has lapsed, resign.
+			if(term < _term)
+			{
+				return;
+			}
+			
 			//TODO: send prepare/accept/success RPCs. 
 			//send out heartbeats every 50(?) ms
 			//could heartbeats be (potentially empty) success rpcs?
 			//refer to proposal numbers on incoming RPC to know when to give up leadership
 			writeln("(", _self, ") Leading in (", term.round, ", ", term.node, ")");
-			import core.thread : Thread;
-			Thread.sleep(dur!"msecs"(100));
+			{
+				_paxosLock.unlock();
+				scope(exit) _paxosLock.lock();
+				
+				import core.thread : Thread;
+				Thread.sleep(dur!"msecs"(100));
+			}
 		}
 		writeln("(", _self, ") Not Leading!");
 	}
@@ -368,7 +420,7 @@ shared class Consensus(T)
 			_RPC identifier;
 			if(receiveType(conn, identifier))
 			{
-				_setRandomTimeout(conn);	//Don't bother resetting this, it'll just get set again in the future.
+				_setTimeout(conn, _randomTimeout(150, 150));	//Don't bother resetting this, it'll just get set again in the future.
 				
 				switch(identifier)
 				{
@@ -384,8 +436,7 @@ shared class Consensus(T)
 						//(leader -> follower) (prop, idx, value): entry at idx is chosen as value [resp: (?)]
 						return true;
 					case _RPC.Request:
-						//(follower -> leader) (prop, value): add value to the next available spot [resp: (?)]
-						return true;
+						return _request(conn);	//(follower -> leader) (prop, value): add value to the next available spot [resp: (?)]
 					default:
 						return false;
 				}
@@ -400,29 +451,12 @@ shared class Consensus(T)
 	 * Casts a vote for a leader if their term number is higher than the local node's number.
 	 *
 	 * Params:
-	 * 	conn = The socket on which to communicate with the candidate.
+	 * 	conn = The socket by which to communicate with the candidate.
 	 *
-	 * Returns: True if the vote completed successfully, false otherwise.
+	 * Returns: True if communication completed successfully, false otherwise.
 	 */
 	private bool _vote(Socket conn)
 	{
-		bool voted = false;
-		scope(exit)
-		{
-			if(voted)
-			{
-				spawn(
-					() shared
-					{
-						synchronized(_paxosLock)
-						{
-							(cast(Condition)_heartbeat).notify();
-						}
-					}
-				);
-			}
-		}
-		
 		writeln("\t(", _self, ") Voting...");
 		
 		ID candidateTerm;
@@ -431,12 +465,11 @@ shared class Consensus(T)
 			synchronized(_paxosLock)
 			{
 				bool success = sendType(conn, _term);
-				
 				writeln("\t(", _self, ") Sent ballot (", _term.round, ", ", _term.node, ") in response to (", candidateTerm.round, ", ", candidateTerm.node, ")");	//This frequently gets called twice for some reason.
 				if(cast(ID)_term < candidateTerm)
 				{
 					_term = candidateTerm;
-					voted = true;
+					(cast(Condition)_heartbeat).notifyAll();
 					writeln("\t\t(", _self, ") Voted for (", _term.round, ", ", _term.node, ")");
 				}
 				
@@ -446,24 +479,156 @@ shared class Consensus(T)
 		
 		return false;
 	}
+	
+	/**
+	 * If this node is the leader, it adds a new entry to the log.
+	 *
+	 * Params:
+	 * 	conn = The socket by which to communicate with the requester.
+	 *
+	 * Returns: True if communication completed successfully, false otherwise.
+	 */
+	private bool _request(Socket conn)
+	{
+		//The entry is received first so we spend less time holding the lock.
+		Tuple!(ID, Entry!T) identifiedEntry;
+		if(receiveType(conn, identifiedEntry))
+		{
+			synchronized(_paxosLock)
+			{
+				if(sendType(conn, _leading))
+				{
+					if(_leading)
+					{
+						//add the entry to the log!
+						//if successful, update the highest recv'd request for the node, then send results back
+						Results!T res = Results!T();	//temporary
+						return sendType(conn, res);
+					}
+					else
+					{
+						return true;
+					}
+				}
+			}
+		}
+		
+		return false;
+	}
+	
+	/**
+	 * Initiate a request to add an entry to the log.
+	 *
+	 * Params:
+	 * 	entry = The log entry to add.
+	 *
+	 * Returns: The results of applying the entry.
+	 */
+	public Results!T request(const Entry!T entry)
+	{
+		uint req;
+		synchronized(_requestsLock)
+		{
+			req = _requests;
+			_requests = _requests + 1;
+		}
+		
+		Results!T results;
+		bool success = false;
+		while(!success)
+		{
+			uint leader;
+			synchronized(_paxosLock)
+			{
+				leader = _term.node;	//Might be prudent to sleep for a few ms (w/o lock) if leader == _term.node already (indicates past failure and no change).
+				
+				//This implies that leader == _self (but the converse is not necessarily true).
+				if(_leading)
+				{
+					//handle request locally by sending out accept messages while the lock is held
+				}
+			}
+			
+			//If this node is not leader, try another node.
+			if(leader != _self)
+			{
+				try
+				{
+					//If another node is leading, send them a request.
+					//Note that &= is used to set success to true iff the delegate set success to true and perform returned true.
+					success &= _sender.perform(_config[leader],
+						delegate bool(Socket conn)
+						{
+							_setTimeout(conn, _randomTimeout(150, 150));
+							
+							_RPC identifier = _RPC.Request;
+							if(sendType(conn, identifier))
+							{
+								Tuple!(ID, const Entry!T) identifiedEntry = Tuple!(ID, const Entry!T)(ID(req, _self), entry);	//Use Cerealed to serialize the entry in the future.
+								if(sendType(conn, identifiedEntry))
+								{
+									bool leading;
+									if(receiveType(conn, leading))
+									{
+										if(leading)
+										{
+											conn.blocking(false);
+											scope(exit) conn.blocking(true);
+											
+											synchronized(_paxosLock)
+											{
+												//While awaiting a result, ensure that heartbeats are arriving.
+												while(!receiveType(conn, results))	//might make sense to set an upper bound on the number of recvs that can happen (so it doesn't loop forever)
+												{
+													//If the leader failed to send a heartbeat, consider the connection toast.
+													//If leadership changed, also close non-gracefully (it would be too much hassle to gracefully shut down).
+													if(!_wait(_heartbeat, _randomTimeout(150, 150)) || _term.node != leader)
+													{
+														return false;
+													}
+												}
+											}
+											
+											success = true;
+											return true;
+										}
+										else
+										{
+											return true;
+										}
+									}
+								}
+							}
+							
+							return false;
+						}
+					);
+				}
+				catch(SocketException) {}
+			}
+		}
+		
+		return results;
+	}
 }
 unittest
 {
+	import std.container.slist;
+	alias TestType = SList!int;
 	Configuration cfg = [new InternetAddress("localhost", 32320), new InternetAddress("localhost", 32321)];
 	
-	shared Consensus!InternetAddress cons0 = new shared Consensus!InternetAddress(0, cfg, "localhost", cast(ushort)1);
-	scope(exit)
-	{
-		import core.thread : Thread;
-		Thread.sleep(dur!"seconds"(1));
-		cons0.teardown();
-	}
+	shared Consensus!TestType cons0 = new shared Consensus!TestType(0, cfg, 1, 2, 3);
+	scope(exit) cons0.teardown();
 	
-	shared Consensus!InternetAddress cons1 = new shared Consensus!InternetAddress(1, cfg, "localhost", cast(ushort)1);
+	shared Consensus!TestType cons1 = new shared Consensus!TestType(1, cfg, 1, 2, 3);
 	scope(exit) cons1.teardown();
 	
 	import core.thread : Thread;
 	Thread.sleep(dur!"seconds"(2));
+	
+	string[] loc = [];	//Would normally be supplied by Distributed!T.
+	cons1.request(Entry!TestType().__ctor!(TestType.removeAny)(loc));	//The removeAny function is nice because it has no template parameters (which entries cannot handle).
+	writeln("(1) Submitted Request!!!");
 }
 
 import std.stdio : writeln;	//temporary

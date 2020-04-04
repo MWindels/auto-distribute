@@ -225,7 +225,7 @@ shared class ConnectionPool
 	 * 	addr = The address to connect to.
 	 * 	dl = A delegate which operates on an open connection.
 	 *
-	 * Returns: True if the pool was open and dl was called, false if the pool was closed and dl was not called (nothing about whether dl completed successfully).
+	 * Returns: True if dl completed successfully, false otherwise.
 	 */
 	public bool perform(const InternetAddress addr, bool delegate(Socket) dl)
 	{
@@ -263,7 +263,6 @@ shared class ConnectionPool
 		scope(failure)
 		{
 			(cast(Socket)conn).close();
-			
 		}
 		
 		if(dl(cast(Socket)conn))
@@ -279,13 +278,14 @@ shared class ConnectionPool
 					(cast(Socket)conn).close();
 				}
 			}
+			
+			return true;
 		}
 		else
 		{
 			(cast(Socket)conn).close();
+			return false;
 		}
-		
-		return true;
 	}
 }
 unittest

@@ -257,6 +257,21 @@ if(is(symbol))
 	return "alias " ~ name ~ " = T." ~ name ~ ";";
 }
 
+/**
+ * Returns an alias to some symbol already in Distributed!T.
+ * Intended to be called at compile time.
+ *
+ * Params:
+ * 	name = The name of the alias.
+ * 	origin = The name of the symbol to which the new alias refers.
+ *
+ * Returns: A string representing an alias.
+ */
+static string _mimicAlias(alias symbol)(immutable string name, immutable string origin) pure @safe
+{
+	return "alias " ~ name ~ " = " ~ origin ~ ";";
+}
+
 
 public:
 
@@ -266,7 +281,7 @@ public:
  */
 class Distributed(T) : Distributed_Base!T
 {
-	mixin(forAllMembers!(T, _mimicFunction, _mimicField, _mimicType)());
+	mixin(forAllMembers!(T, _mimicFunction, _mimicField, _mimicType, _mimicAlias)());
 }
 unittest
 {
